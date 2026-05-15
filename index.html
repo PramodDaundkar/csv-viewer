@@ -64,6 +64,12 @@
     }
     @keyframes spin  { to { transform: rotate(360deg); } }
     @keyframes pulse { 0%,100% { opacity:.35; } 50% { opacity:.9; } }
+    /* DuckDB engine badge */
+    #duck-mode-badge {
+      display: none; align-items: center; gap: 5px; padding: 2px 10px;
+      background: rgba(63,185,80,.1); border: 1px solid #3fb950; border-radius: 10px;
+      font-size: 11px; color: #3fb950; font-weight: 600;
+    }
     #loading-msg    { font-size: 14px; color: #8b949e; }
     #progress-wrap  { width: 280px; height: 5px; background: #21262d; border-radius: 3px; overflow: hidden; }
     #progress-bar   { height: 100%; width: 0%; background: #3fb950; border-radius: 3px; transition: width .25s; }
@@ -356,6 +362,7 @@
     <span class="stat">Showing: <strong id="s-showing">—</strong></span>
     <div class="divider"></div>
     <span id="delim-badge">delimiter: ,</span>
+    <span id="duck-mode-badge">🦆 DuckDB Engine</span>
     <span id="query-mode-badge" title="Click to exit query mode">
       <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
@@ -493,6 +500,18 @@ let queryResultRows = null;
 let rowObjects   = [];
 let currentFile  = null;
 let detectedDelim = ',';
+// DuckDB state
+let duckMode     = false;
+let duckTotal    = 0;
+let duckFilter   = '';
+let duckOrderBy  = '';
+let duckCache    = new Map();
+let duckFetching = new Set();
+let duckDB       = null;
+let duckConn     = null;
+let duckMod      = null;
+const DUCK_THRESHOLD_BYTES = 5 * 1024 * 1024;  // 5 MB → switch to DuckDB
+const DUCK_PAGE            = 2_000;
 
 const COL_W  = 160;
 const COL_MIN = 40;
@@ -549,6 +568,9 @@ document.getElementById('load-new-btn').addEventListener('click', () => {
   allRows=[]; filteredRows=[]; columns=[]; colVisible={}; colWidths={}; colFilters={}; rowObjects=[];
   sortCol=null; searchQuery=''; queryMode=false; queryResultCols=null; queryResultRows=null;
   currentFile=null;
+  duckMode=false; duckTotal=0; duckFilter=''; duckOrderBy='';
+  duckCache.clear(); duckFetching.clear();
+  document.getElementById('duck-mode-badge').style.display='none';
   searchBox.value=''; searchInfo.textContent=''; clearFiltersBtn.style.display='none';
   queryPanel.classList.remove('open'); queryModeBadge.classList.remove('visible');
   document.body.classList.remove('query-mode');
@@ -572,6 +594,18 @@ async function loadFile(file) {
   currentFile = file;
   showLoading();
   setProgress(5, `Reading ${file.name}…`);
+
+  // Reset state
+  duckMode=false; duckFilter=''; duckOrderBy=''; duckCache.clear(); duckFetching.clear();
+  sortCol=null; queryMode=false; queryResultCols=null; queryResultRows=null;
+  document.getElementById('duck-mode-badge').style.display='none';
+
+  if (file.size >= DUCK_THRESHOLD_BYTES) {
+    // ── DuckDB path for large files ──────────────────────────
+    await loadWithDuckDB(file);
+    return;
+  }
+  // ── Papa Parse path for small files ─────────────────────────
 
   const opts = getParseOptions();
   const totalBytes = file.size;
@@ -664,14 +698,169 @@ function delimLabel(d) {
   return `, (comma)`;
 }
 
-/* ─── Re-parse button ────────────────────────────────────── */
-document.getElementById('reparse-btn').addEventListener('click', () => {
+// Re-parse button is now handled inside the DuckDB engine section above
+
+/* ─── DuckDB engine ──────────────────────────────────────── */
+async function ensureDuckDB() {
+  if (duckDB) return;
+  setProgress(15, 'Loading DuckDB engine (~6 MB)…');
+  const mod = await import('https://esm.sh/@duckdb/duckdb-wasm');
+  duckMod = mod;
+  const WASM = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm/dist/';
+  const bundles = {
+    mvp: { mainModule: WASM+'duckdb-mvp.wasm', mainWorker: WASM+'duckdb-browser-mvp.worker.js' },
+    eh:  { mainModule: WASM+'duckdb-eh.wasm',  mainWorker: WASM+'duckdb-browser-eh.worker.js',
+           pthreadWorker: WASM+'duckdb-browser-eh.pthread.worker.js' },
+  };
+  const bundle = await mod.selectBundle(bundles);
+  const workerUrl = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'application/javascript' })
+  );
+  const worker = new Worker(workerUrl);
+  const logger = new mod.ConsoleLogger(mod.LogLevel.WARNING);
+  duckDB = new mod.AsyncDuckDB(logger, worker);
+  await duckDB.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(workerUrl);
+  duckConn = await duckDB.connect();
+}
+
+// Build read_csv_auto options string from UI settings
+function csvReadOptions() {
+  const delimOpt = document.getElementById('opt-delimiter').value;
+  const hasHeader = document.getElementById('opt-header').checked;
+  const parts = [`header=${hasHeader}`];
+  if (delimOpt !== 'auto') parts.push(`delim='${delimOpt.replace(/'/g,"''")}'`);
+  return parts.join(', ');
+}
+
+async function loadWithDuckDB(file) {
+  await ensureDuckDB();
+  setProgress(50, 'Registering CSV with DuckDB…');
+
+  const protocol = duckMod?.DuckDBDataProtocol?.BROWSER_FILEREADER ?? 2;
+  await duckDB.registerFileHandle('upload.csv', file, protocol, true);
+
+  setProgress(65, 'Scanning schema…');
+  const opts = csvReadOptions();
+  await duckConn.query(`CREATE OR REPLACE VIEW data AS SELECT * FROM read_csv_auto('upload.csv', ${opts})`);
+
+  const schemaRes = await duckConn.query('DESCRIBE data');
+  const dkCols = schemaRes.toArray().map(r => r.column_name);
+
+  // Try to get detected delimiter via sniff_csv
+  try {
+    const sniff = await duckConn.query("SELECT Delimiter FROM sniff_csv('upload.csv') LIMIT 1");
+    detectedDelim = sniff.toArray()[0]?.Delimiter ?? ',';
+  } catch { detectedDelim = ','; }
+
+  setProgress(80, 'Counting rows…');
+  const countRes = await duckConn.query('SELECT COUNT(*)::BIGINT AS n FROM data');
+  const total = Number(countRes.toArray()[0].n);
+
+  // Update state
+  columns = dkCols; duckMode = true; duckTotal = total;
+  duckFilter = ''; duckOrderBy = ''; duckCache.clear(); duckFetching.clear();
+  colVisible={}; colWidths={}; colFilters={};
+  columns.forEach(c => { colVisible[c]=true; colWidths[c]=COL_W; colFilters[c]=''; });
+
+  // Update stats bar
+  document.getElementById('s-rows').textContent    = total.toLocaleString();
+  document.getElementById('s-cols').textContent    = columns.length;
+  document.getElementById('s-file').textContent    = file.name;
+  document.getElementById('s-size').textContent    = fmtBytes(file.size);
+  document.getElementById('delim-badge').textContent = `delimiter: ${delimLabel(detectedDelim)}`;
+  document.getElementById('duck-mode-badge').style.display = 'inline-flex';
+
+  // Reset query state
+  queryPanel.classList.remove('open'); querySql.value='';
+  queryError.classList.remove('visible'); queryStatus.classList.remove('visible');
+  queryModeBadge.classList.remove('visible'); document.body.classList.remove('query-mode');
+  clearFiltersBtn.style.display='none';
+
+  updateShowing(); buildColPanel(); buildColChips(); buildHeader(); setupVirtualScroll(); showViewer();
+}
+
+function arrowToRows(result, cols) {
+  return result.toArray().map(row =>
+    cols.map(col => { const v=row[col]; if(v===null||v===undefined)return null; if(typeof v==='bigint')return Number(v); return v; })
+  );
+}
+
+async function fetchDuckPage(pageIdx) {
+  if (duckFetching.has(pageIdx) || duckCache.has(pageIdx)) return;
+  duckFetching.add(pageIdx);
+  const offset = pageIdx * DUCK_PAGE;
+  const where  = duckFilter  ? `WHERE ${duckFilter}`    : '';
+  const order  = duckOrderBy ? `ORDER BY ${duckOrderBy}` : '';
+  try {
+    const res = await duckConn.query(`SELECT * FROM data ${where} ${order} LIMIT ${DUCK_PAGE} OFFSET ${offset}`);
+    duckCache.set(pageIdx, arrowToRows(res, columns));
+    duckFetching.delete(pageIdx);
+    if (!rafPending) { rafPending=true; requestAnimationFrame(()=>{ renderRows(); rafPending=false; }); }
+  } catch(e) { console.error('DuckDB page fetch:', e); duckFetching.delete(pageIdx); }
+}
+
+function getDuckWindowRows(startIdx, endIdx) {
+  const out=[], startPage=Math.floor(startIdx/DUCK_PAGE), endPage=Math.floor(Math.max(0,endIdx-1)/DUCK_PAGE);
+  for (let p=startPage; p<=endPage; p++) {
+    if (!duckCache.has(p)) fetchDuckPage(p);
+    const page=duckCache.get(p), pBase=p*DUCK_PAGE;
+    const lo=Math.max(0,startIdx-pBase), hi=Math.min(page?page.length:DUCK_PAGE,endIdx-pBase);
+    for (let i=lo;i<hi;i++) out.push(page?page[i]:null);
+  }
+  return out;
+}
+
+async function updateDuckFilter() {
+  const conds=[];
+  if (searchQuery) {
+    const parts=columns.map(c=>`TRY_CAST("${c.replace(/"/g,'""')}" AS VARCHAR) ILIKE '%${searchQuery.replace(/'/g,"''")}%'`);
+    if (parts.length) conds.push(`(${parts.join(' OR ')})`);
+  }
+  columns.forEach(c=>{
+    const f=(colFilters[c]||'').trim();
+    if(f) conds.push(`TRY_CAST("${c.replace(/"/g,'""')}" AS VARCHAR) ILIKE '%${f.replace(/'/g,"''")}%'`);
+  });
+  duckFilter=conds.join(' AND ');
+  duckCache.clear(); duckFetching.clear();
+  const where=duckFilter?`WHERE ${duckFilter}`:'';
+  const countRes=await duckConn.query(`SELECT COUNT(*)::BIGINT AS n FROM data ${where}`);
+  duckTotal=Number(countRes.toArray()[0].n);
+  const active=conds.length>0;
+  searchInfo.textContent=active?`${duckTotal.toLocaleString()} matches`:'';
+  clearFiltersBtn.style.display=columns.some(c=>(colFilters[c]||'').trim())?'inline-flex':'none';
+  document.getElementById('s-showing').textContent=duckTotal.toLocaleString();
+  setupVirtualScroll();
+}
+
+// Re-parse in DuckDB mode when options change
+document.getElementById('reparse-btn').addEventListener('click', async () => {
   csvOptionsPanel.classList.remove('open');
-  if (currentFile) loadFile(currentFile);
+  if (!currentFile) return;
+  if (duckMode) {
+    showLoading(); setProgress(60, 'Applying new options…');
+    try {
+      const opts = csvReadOptions();
+      await duckConn.query(`CREATE OR REPLACE VIEW data AS SELECT * FROM read_csv_auto('upload.csv', ${opts})`);
+      const schemaRes = await duckConn.query('DESCRIBE data');
+      columns = schemaRes.toArray().map(r => r.column_name);
+      const countRes = await duckConn.query('SELECT COUNT(*)::BIGINT AS n FROM data');
+      duckTotal = Number(countRes.toArray()[0].n);
+      colVisible={}; colWidths={}; colFilters={};
+      columns.forEach(c=>{ colVisible[c]=true; colWidths[c]=COL_W; colFilters[c]=''; });
+      document.getElementById('s-rows').textContent=duckTotal.toLocaleString();
+      document.getElementById('s-cols').textContent=columns.length;
+      duckFilter=''; duckOrderBy=''; duckCache.clear(); duckFetching.clear();
+      updateShowing(); buildColPanel(); buildColChips(); buildHeader(); setupVirtualScroll(); showViewer();
+    } catch(e) { showError('Re-parse failed: ' + e.message); }
+  } else {
+    loadFile(currentFile);
+  }
 });
 
 /* ─── filter + search ────────────────────────────────────── */
 function applyFilters() {
+  if (duckMode) { updateDuckFilter(); return; }
   let rows = allRows;
   if (searchQuery) {
     const q = searchQuery;
@@ -709,6 +898,11 @@ clearFiltersBtn.addEventListener('click', () => {
 function sortBy(col) {
   if (queryMode) return;
   if (sortCol === col) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; } else { sortCol = col; sortDir = 'asc'; }
+  if (duckMode) {
+    duckOrderBy = `"${col.replace(/"/g,'""')}" ${sortDir.toUpperCase()}`;
+    duckCache.clear(); duckFetching.clear();
+    updateSortHeaders(); setupVirtualScroll(); return;
+  }
   filteredRows = sortedRows(filteredRows); updateSortHeaders(); setupVirtualScroll();
 }
 function sortedRows(rows) {
@@ -751,11 +945,14 @@ csvOptionsPanel.addEventListener('click', e => e.stopPropagation());
 /* ─── col widths CSS ─────────────────────────────────────── */
 function getTableState() {
   if (queryMode && queryResultCols) {
-    return { cols: queryResultCols, rows: queryResultRows, cellVal: (r, i) => r[i], total: queryResultRows.length };
+    return { cols: queryResultCols, rows: queryResultRows, cellVal: (r,i) => r?r[i]:null, total: queryResultRows.length, isDuck: false };
   }
-  const vis = visibleCols();
-  const idx = vis.map(c => columns.indexOf(c));
-  return { cols: vis, rows: filteredRows, cellVal: (r, i) => r[idx[i]], total: filteredRows.length };
+  if (duckMode) {
+    const vis=visibleCols(), idx=vis.map(c=>columns.indexOf(c));
+    return { cols: vis, rows: null, cellVal: (r,i) => r?r[idx[i]]:null, total: duckTotal, isDuck: true };
+  }
+  const vis=visibleCols(), idx=vis.map(c=>columns.indexOf(c));
+  return { cols: vis, rows: filteredRows, cellVal: (r,i) => r[idx[i]], total: filteredRows.length, isDuck: false };
 }
 function applyColWidths() {
   const { cols } = getTableState();
@@ -814,14 +1011,15 @@ function buildFilterRow() {
 /* ─── virtual scroll ─────────────────────────────────────── */
 let rafPending = false;
 function setupVirtualScroll() {
-  const { total } = getTableState();
+  const { total, isDuck } = getTableState();
   vbody.style.height = (total * ROW_H) + 'px';
   vbody.style.position = 'relative';
   vbody.innerHTML = '';
+  if (isDuck) fetchDuckPage(0);
   renderRows();
 }
 function renderRows() {
-  const { cols, rows, cellVal, total } = getTableState();
+  const { cols, rows, cellVal, total, isDuck } = getTableState();
   const scrollTop = tableWrap.scrollTop;
   const viewH = tableWrap.clientHeight - headerGroup.offsetHeight;
   const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
@@ -829,27 +1027,36 @@ function renderRows() {
   vbody.innerHTML = '';
   const frag = document.createDocumentFragment();
   const hlq  = queryMode ? '' : searchQuery;
+  const duckWin = isDuck ? getDuckWindowRows(startIdx, endIdx) : null;
   for (let i = startIdx; i < endIdx; i++) {
-    const rowData = rows[i];
+    const rowData = isDuck ? duckWin[i-startIdx] : rows[i];
     const div = document.createElement('div');
     div.className = `row ${i%2===0?'even':'odd'}`;
     div.style.cssText = `position:absolute;top:${i*ROW_H}px;left:0;right:0;height:${ROW_H}px;display:flex;align-items:center;`;
     const rn = document.createElement('div'); rn.className='td rownum'; rn.textContent=(i+1).toLocaleString(); div.appendChild(rn);
-    cols.forEach((col, colPos) => {
-      const val = cellVal(rowData, colPos);
-      const td = document.createElement('div'); td.className=`td pv-col-${colPos}`;
-      let text;
-      if (val === null || val === undefined) { text='null'; td.classList.add('null-val'); }
-      else if (val === '') { text='empty'; td.classList.add('empty-val'); }
-      else if (typeof val === 'number') { text=String(val); td.classList.add('num-val'); }
-      else if (typeof val === 'boolean') { text=String(val); td.classList.add('bool-val'); }
-      else { text = String(val); }
-      if (hlq && text.toLowerCase().includes(hlq)) {
-        const re = new RegExp(hlq.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
-        td.innerHTML = text.replace(re, m => `<mark>${m}</mark>`);
-      } else { td.textContent = text; }
-      td.title = text; div.appendChild(td);
-    });
+    if (rowData === null) {
+      cols.forEach((_,colPos) => {
+        const td=document.createElement('div'); td.className=`td pv-col-${colPos}`;
+        td.innerHTML='<span style="background:#21262d;border-radius:3px;display:inline-block;width:60%;height:10px;animation:pulse 1.5s ease-in-out infinite"></span>';
+        div.appendChild(td);
+      });
+    } else {
+      cols.forEach((col, colPos) => {
+        const val = cellVal(rowData, colPos);
+        const td = document.createElement('div'); td.className=`td pv-col-${colPos}`;
+        let text;
+        if (val === null || val === undefined) { text='null'; td.classList.add('null-val'); }
+        else if (val === '') { text='empty'; td.classList.add('empty-val'); }
+        else if (typeof val === 'number' || typeof val === 'bigint') { text=String(val); td.classList.add('num-val'); }
+        else if (typeof val === 'boolean') { text=String(val); td.classList.add('bool-val'); }
+        else { text = String(val); }
+        if (hlq && text.toLowerCase().includes(hlq)) {
+          const re = new RegExp(hlq.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
+          td.innerHTML = text.replace(re, m => `<mark>${m}</mark>`);
+        } else { td.textContent = text; }
+        td.title = text; div.appendChild(td);
+      });
+    }
     frag.appendChild(div);
   }
   vbody.appendChild(frag);
@@ -965,23 +1172,29 @@ function buildColChips() {
     colChipsList.appendChild(chip);
   });
 }
-function runQuery() {
+async function runQuery() {
   const sql = querySql.value.trim(); if (!sql) return;
   queryError.classList.remove('visible'); queryStatus.classList.remove('visible');
-  if (!window.alasql) { showQErr('AlaSQL not loaded.'); return; }
   try {
-    const results = alasql(sql);
-    if (!Array.isArray(results)) {
-      queryStatus.textContent = `✓ Result: ${JSON.stringify(results)}`;
-      queryStatus.classList.add('visible'); return;
+    let resultCols, resultRows;
+    if (duckMode && duckConn) {
+      const res = await duckConn.query(sql);
+      if (!res?.schema) { queryStatus.textContent='✓ Query executed'; queryStatus.classList.add('visible'); return; }
+      resultCols = res.schema.fields.map(f => f.name);
+      resultRows = arrowToRows(res, resultCols);
+    } else {
+      if (!window.alasql) { showQErr('AlaSQL not loaded.'); return; }
+      const results = alasql(sql);
+      if (!Array.isArray(results)) { queryStatus.textContent=`✓ Result: ${JSON.stringify(results)}`; queryStatus.classList.add('visible'); return; }
+      resultCols = results.length>0 ? Object.keys(results[0]) : columns.slice();
+      resultRows = results.map(obj => resultCols.map(c => obj[c]));
     }
-    queryResultCols = results.length > 0 ? Object.keys(results[0]) : columns.slice();
-    queryResultRows = results.map(obj => queryResultCols.map(c => obj[c]));
-    queryMode = true; sortCol = null;
+    queryResultCols=resultCols; queryResultRows=resultRows;
+    queryMode=true; sortCol=null;
     document.body.classList.add('query-mode'); queryModeBadge.classList.add('visible');
-    queryStatus.textContent = `✓ ${queryResultRows.length.toLocaleString()} row${queryResultRows.length!==1?'s':''} returned`;
+    queryStatus.textContent=`✓ ${resultRows.length.toLocaleString()} row${resultRows.length!==1?'s':''} returned`;
     queryStatus.classList.add('visible');
-    document.getElementById('s-showing').textContent = queryResultRows.length.toLocaleString();
+    document.getElementById('s-showing').textContent=resultRows.length.toLocaleString();
     buildHeader(); setupVirtualScroll();
   } catch(err) { showQErr(err.message); }
 }
@@ -1021,7 +1234,10 @@ function onResizeEnd(){
 
 /* ─── helpers ────────────────────────────────────────────── */
 function updateShowing(){
-  const n = queryMode&&queryResultRows ? queryResultRows.length : filteredRows.length;
+  let n;
+  if (queryMode&&queryResultRows) n=queryResultRows.length;
+  else if (duckMode)              n=duckTotal;
+  else                            n=filteredRows.length;
   document.getElementById('s-showing').textContent = n.toLocaleString();
 }
 function fmtBytes(b){
