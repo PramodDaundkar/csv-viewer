@@ -1,22 +1,9 @@
-# CSV Viewer
+# ⚠️ This repo has moved
 
-A lightweight, browser-based CSV file viewer. No installation required — open `index.html` in any modern browser.
+**[Data Viewer](https://github.com/PramodDaundkar/data-viewer)** is the new unified viewer that supports both Parquet and CSV files.
 
-## Features
-- Drag & drop `.csv`, `.tsv`, `.txt` files
-- Auto-detects delimiter (comma, semicolon, tab, pipe)
-- Virtual scrolling (handles large files smoothly)
-- Per-column filtering with AND logic
-- Global search with match highlighting
-- Sort by any column
-- Drag-to-resize columns
-- Toggle column visibility
-- CSV options: override delimiter, toggle header row, skip empty rows
-- SQL query editor (powered by AlaSQL) with autocomplete
+👉 **New URL:** https://pramoddaundkar.github.io/data-viewer/
 
-## Usage
-1. Open `index.html` in your browser
-2. Drop a CSV file onto the upload zone
-3. Explore your data
+---
 
-All processing happens locally in your browser — no data is ever uploaded.
+This repo (`csv-viewer`) is no longer actively maintained. The code remains here and the GitHub Pages URL continues to work, but all future development happens in [data-viewer](https://github.com/PramodDaundkar/data-viewer).
